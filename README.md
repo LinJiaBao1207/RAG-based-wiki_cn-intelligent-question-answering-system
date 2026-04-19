@@ -5,6 +5,7 @@
 - 回答风格：简洁事实型。
 - 上线形态：Web（FastAPI + 简单前端）。
 - 文本统一：离线处理中统一转简体。
+- 数据集地址：https://opendatalab.com/ABear/Wiki_CN
 - 前端页面如图所示
  <img width="1906" height="881" alt="微信图片_20260416205301_309_15" src="https://github.com/user-attachments/assets/0bc4cbb8-f1f3-4cc6-b469-ae0a6b15952d" />
 

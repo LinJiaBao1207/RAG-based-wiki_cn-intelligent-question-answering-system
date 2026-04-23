@@ -7,7 +7,7 @@
 - 文本统一：离线处理中统一转简体。
 - 数据集地址：https://opendatalab.com/ABear/Wiki_CN
 - 前端页面如图所示
- <img width="1906" height="881" alt="微信图片_20260416205301_309_15" src="https://github.com/user-attachments/assets/0bc4cbb8-f1f3-4cc6-b469-ae0a6b15952d" />
+ <img width="1906" height="874" alt="3c072380628fad02d103b2888e8e2df6" src="https://github.com/user-attachments/assets/880efb46-662f-4d39-b5d8-9e108b7351dd" />
 
 
 ## 目录

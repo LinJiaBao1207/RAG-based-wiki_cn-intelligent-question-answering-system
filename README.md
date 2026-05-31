@@ -1,6 +1,7 @@
 # Wiki-CN 问答系统骨架（Python + Web）
 
 优化改良后的效果链接：【基于 RAG 的 Wiki_CN 智能问答系统演示】 https://www.bilibili.com/video/BV1cb5y6AE68/?share_source=copy_web&vd_source=f486789e701626cf145934c007761661
+
 目标约束：
 - 问答范围：当前仅基于 wiki-cn 知识库回答。
 - 回答风格：简洁事实型。

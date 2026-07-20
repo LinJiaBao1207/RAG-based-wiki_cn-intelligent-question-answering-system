@@ -16,3 +16,4 @@ pymilvus==2.4.9
 setuptools>=68,<81
 marshmallow<4
 sentence-transformers>=2.3.0
+chromadb

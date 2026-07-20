@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>系统健康页</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
+  <link rel="stylesheet" href="/static/health.css?v=2" />
+</head>
+<body>
+  <div class="health-shell">
+    <header class="hero">
+      <div class="hero-copy">
+        <div class="eyebrow">Wiki-CN RAG Runtime</div>
+        <h1>系统健康页</h1>
+        <p>这不是原始 JSON 转储，而是一张面向人看的运行面板。你可以直接判断当前用了哪些模块、启用了什么模式，以及瓶颈卡在哪一层。</p>
+      </div>
+      <div class="hero-actions">
+        <a class="ghost-btn" href="/api/health?format=json" target="_blank" rel="noopener noreferrer">查看原始 JSON</a>
+        <button id="refreshBtn" class="solid-btn">立即刷新</button>
+      </div>
+    </header>
+
+    <main class="health-grid">
+      <section class="card summary-card">
+        <div class="section-head">
+          <div>
+            <div class="section-kicker">总览</div>
+            <h2>当前运行状态</h2>
+          </div>
+          <div id="statusBadge" class="badge neutral">加载中</div>
+        </div>
+        <div class="summary-metrics">
+          <div class="metric-tile">
+            <span class="metric-label">检索模式</span>
+            <strong id="retrievalMode">-</strong>
+            <small id="retrievalModeHint">-</small>
+          </div>
+          <div class="metric-tile">
+            <span class="metric-label">生成模式</span>
+            <strong id="generationMode">-</strong>
+            <small id="generationModeHint">-</small>
+          </div>
+          <div class="metric-tile">
+            <span class="metric-label">索引规模</span>
+            <strong id="indexScale">-</strong>
+            <small id="indexScaleHint">-</small>
+          </div>
+          <div class="metric-tile">
+            <span class="metric-label">当前阶段</span>
+            <strong id="engineStage">-</strong>
+            <small id="engineStageHint">-</small>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="section-head">
+          <div>
+            <div class="section-kicker">链路</div>
+            <h2>模块与模式</h2>
+          </div>
+        </div>
+        <div id="moduleMatrix" class="module-matrix"></div>
+      </section>
+
+      <section class="card">
+        <div class="section-head">
+          <div>
+            <div class="section-kicker">配置</div>
+            <h2>当前实际使用的后端</h2>
+          </div>
+        </div>
+        <dl id="backendFacts" class="fact-list"></dl>
+      </section>
+
+      <section class="card">
+        <div class="section-head">
+          <div>
+            <div class="section-kicker">加载过程</div>
+            <h2>引擎阶段与耗时</h2>
+          </div>
+        </div>
+        <div id="stageTimeline" class="stage-timeline"></div>
+      </section>
+
+      <section class="card">
+        <div class="section-head">
+          <div>
+            <div class="section-kicker">诊断</div>
+            <h2>为什么当前是这个模式</h2>
+          </div>
+        </div>
+        <div id="diagnostics" class="diagnostics"></div>
+      </section>
+
+      <section class="card json-card">
+        <div class="section-head">
+          <div>
+            <div class="section-kicker">原始数据</div>
+            <h2>Health JSON 快照</h2>
+          </div>
+        </div>
+        <pre id="rawJson" class="raw-json" translate="no"></pre>
+      </section>
+    </main>
+  </div>
+
+  <script src="/static/health.js?v=2"></script>
+</body>
+</html>

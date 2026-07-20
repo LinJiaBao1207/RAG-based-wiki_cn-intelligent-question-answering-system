@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import time
@@ -136,9 +137,10 @@ def main() -> None:
                         if not content:
                             continue
 
-                        content = clean_text(content)
-                        content = cc.convert(content)
-                        title = extract_title(content)
+                        content_orig = clean_text(content)
+                        content_sim = cc.convert(content_orig)
+                        title = extract_title(content_sim)
+                        content_hash = hashlib.sha1(content_sim.encode("utf-8")).hexdigest()
 
                         row = {
                             "doc_id": str(obj.get("doc_id", obj.get("id", ""))),
@@ -146,7 +148,9 @@ def main() -> None:
                             "source_id": str(obj.get("source_id", "")),
                             "url": obj.get("data_url", ""),
                             "title": title,
-                            "content": content,
+                            "content": content_sim,
+                            "content_zh_hant": content_orig,
+                            "content_hash": content_hash,
                         }
                         fw.write(json.dumps(row, ensure_ascii=False) + "\n")
                         count += 1

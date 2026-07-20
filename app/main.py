@@ -5,19 +5,35 @@ import time
 from pathlib import Path
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+import json
+
+try:
+    import redis
+except ImportError:
+    redis = None
 
 from .rag_engine import RagEngine
-from .schemas import AskRequest, AskResponse, HealthResponse
-
+from .schemas import AskRequest, AskResponse, HealthResponse, ClearHistoryRequest, ClearHistoryResponse
+from .config import REDIS_URL, MAX_HISTORY_ROUNDS
 
 app = FastAPI(title="Wiki-CN QA Web", version="0.1.0")
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
+
+# 尝试初始化 Redis 客户端
+redis_client = None
+if redis:
+    try:
+        redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+        redis_client.ping() # test connection
+    except Exception as e:
+        print(f"Redis 连接失败，退回本地内存: {e}")
+        redis_client = None
 
 _sessions_store: dict[str, list[dict[str, str]]] = {}
 _session_lock = threading.Lock()
@@ -27,11 +43,11 @@ _engine_thread: threading.Thread | None = None
 _engine_lock = threading.Lock()
 _RETRY_BASE_SECONDS = 10.0
 _RETRY_MAX_SECONDS = 180.0
-_STAGE_ORDER = ["loading_chunks", "loading_bm25", "loading_faiss", "initializing_client"]
+_STAGE_ORDER = ["loading_chunks", "loading_bm25", "loading_chroma", "initializing_client"]
 _DEFAULT_STAGE_EST_SEC = {
     "loading_chunks": 180.0,
     "loading_bm25": 240.0,
-    "loading_faiss": 300.0,
+    "loading_chroma": 300.0,
     "initializing_client": 6.0,
 }
 _PRED_INTERVAL_FACTORS = {
@@ -41,7 +57,7 @@ _PRED_INTERVAL_FACTORS = {
 }
 _engine_state = {
     "phase": "idle",  # idle | loading | retry_wait | ready
-    "stage": "idle",  # loading_chunks | loading_bm25 | loading_faiss | initializing_client | ready
+    "stage": "idle",  # loading_chunks | loading_bm25 | loading_chroma | initializing_client | ready
     "started_at": 0.0,
     "ready_at": 0.0,
     "error": "",
@@ -140,6 +156,27 @@ def startup_event():
     _ensure_engine_loading()
 
 
+def _load_session_history(session_id: str) -> list[dict[str, str]]:
+    if redis_client:
+        raw = redis_client.get(f"session:{session_id}")
+        return json.loads(raw) if raw else []
+    with _session_lock:
+        if session_id not in _sessions_store:
+            _sessions_store[session_id] = []
+        return list(_sessions_store[session_id])
+
+
+def _save_session_history(session_id: str, session_history: list[dict[str, str]]) -> None:
+    if len(session_history) > MAX_HISTORY_ROUNDS * 2:
+        session_history = session_history[-(MAX_HISTORY_ROUNDS * 2):]
+
+    if redis_client:
+        redis_client.set(f"session:{session_id}", json.dumps(session_history, ensure_ascii=False), ex=86400)
+    else:
+        with _session_lock:
+            _sessions_store[session_id] = session_history
+
+
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
@@ -166,26 +203,78 @@ def ask_api(payload: AskRequest):
         return AskResponse(answer="知识库正在后台加载中，请稍后再试。", references=[])
 
     session_id = payload.session_id
-    with _session_lock:
-        if session_id not in _sessions_store:
-            _sessions_store[session_id] = []
-        history = _sessions_store[session_id][-payload.history_len * 2:] if payload.history_len > 0 else []
+    history_len = min(payload.history_len, MAX_HISTORY_ROUNDS)
+    session_history = _load_session_history(session_id)
+    history = session_history[-history_len * 2:] if history_len > 0 else []
 
     answer, refs = engine.ask(q, history=history, allow_web=payload.allow_web)
 
-    with _session_lock:
-        if session_id in _sessions_store:
-            _sessions_store[session_id].append({"role": "user", "content": q})
-            _sessions_store[session_id].append({"role": "assistant", "content": answer})
-            # keep an upper bound on memory to prevent leak
-            if len(_sessions_store[session_id]) > 100:
-                _sessions_store[session_id] = _sessions_store[session_id][-50:]
+    session_history.append({"role": "user", "content": q})
+    session_history.append({"role": "assistant", "content": answer})
+    _save_session_history(session_id, session_history)
 
     return AskResponse(answer=answer, references=refs)
 
 
-@app.get("/api/health", response_model=HealthResponse)
-def health_api():
+@app.post("/api/ask/stream")
+def ask_stream_api(payload: AskRequest):
+    _ensure_engine_loading()
+
+    q = payload.question.strip()
+    if not q:
+        return StreamingResponse(iter([json.dumps({"type": "error", "message": "请输入问题。"}, ensure_ascii=False) + "\n"]), media_type="application/x-ndjson")
+
+    if engine is None:
+        state = _engine_state_snapshot()
+        if state.get("phase") == "retry_wait":
+            retry_in = max(0.0, float(state.get("next_retry_at", 0.0)) - time.time())
+            message = f"知识库加载失败，系统将在 {retry_in:.1f}s 后自动重试。"
+        else:
+            message = "知识库正在后台加载中，请稍后再试。"
+        return StreamingResponse(iter([json.dumps({"type": "error", "message": message}, ensure_ascii=False) + "\n"]), media_type="application/x-ndjson")
+
+    session_id = payload.session_id
+    history_len = min(payload.history_len, MAX_HISTORY_ROUNDS)
+    session_history = _load_session_history(session_id)
+    history = session_history[-history_len * 2:] if history_len > 0 else []
+
+    def event_iter():
+        answer_parts: list[str] = []
+        refs: list[dict] = []
+        try:
+            for event in engine.stream_answer(q, history=history, allow_web=payload.allow_web):
+                if event.get("type") == "chunk":
+                    delta = str(event.get("delta", ""))
+                    if delta:
+                        answer_parts.append(delta)
+                elif event.get("type") == "done":
+                    refs.clear()
+                    refs.extend(event.get("references", []) or [])
+                yield json.dumps(event, ensure_ascii=False) + "\n"
+        finally:
+            final_answer = "".join(answer_parts).strip()
+            if final_answer:
+                updated_history = session_history + [
+                    {"role": "user", "content": q},
+                    {"role": "assistant", "content": final_answer},
+                ]
+                _save_session_history(session_id, updated_history)
+
+    return StreamingResponse(event_iter(), media_type="application/x-ndjson")
+
+
+@app.post("/api/ask/clear", response_model=ClearHistoryResponse)
+def clear_history_api(payload: ClearHistoryRequest):
+    session_id = payload.session_id
+    if redis_client:
+        redis_client.delete(f"session:{session_id}")
+    else:
+        with _session_lock:
+            if session_id in _sessions_store:
+                del _sessions_store[session_id]
+    return ClearHistoryResponse(success=True, message=f"已清空 session: {session_id} 的历史记录")
+
+def _build_health_payload() -> dict:
     _ensure_engine_loading()
 
     now = time.time()
@@ -251,10 +340,15 @@ def health_api():
             "vector_enabled": False,
             "llm_enabled": False,
             "dense_backend": "unknown",
+            "chroma_persist_dir": "",
+            "chroma_collection": "",
             "force_bm25_only": False,
             "dense_ready": False,
             "dense_disabled_reason": "",
             "llm_primary_provider": "unknown",
+            "llm_primary_model": "",
+            "llm_fallback_provider": "",
+            "llm_fallback_model": "",
             "llm_fallback_enabled": False,
             "llm_provider_last": "extractive",
             "web_fallback_enabled": False,
@@ -262,6 +356,7 @@ def health_api():
             "llm_cooldown_left_sec": 0.0,
             "total_chunks": 0,
             "index_ntotal": 0,
+            "dense_index_count_ok": False,
             "last_bm25_hits": 0,
             "last_vec_hits": 0,
             "last_vec_used": False,
@@ -305,4 +400,15 @@ def health_api():
         }
     )
 
+    return payload
+
+
+@app.get("/api/health")
+def health_api(request: Request):
+    wants_json = request.query_params.get("format", "").lower() == "json"
+    accepts = request.headers.get("accept", "").lower()
+    if not wants_json and "text/html" in accepts:
+        return templates.TemplateResponse("health.html", {"request": request})
+
+    payload = _build_health_payload()
     return HealthResponse(**payload)

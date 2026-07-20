@@ -5,13 +5,14 @@ import gc
 import json
 import pickle
 import re
+import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import faiss
-import jieba
+import chromadb
+import sentencepiece as spm
 import numpy as np
 from openai import OpenAI
 from rank_bm25 import BM25Okapi
@@ -24,6 +25,8 @@ class Chunk:
     title: str
     url: str
     text: str
+    text_zh_hant: str
+    content_hash: str
 
 
 def split_by_heading(text: str) -> list[str]:
@@ -154,18 +157,31 @@ def build_chunks(corpus_path: Path, max_len: int, overlap: int, min_len: int, pr
     doc_count = 0
     for doc in load_corpus(corpus_path):
         doc_count += 1
-        doc_id = doc.get("doc_id", "")
+        doc_id = str(doc.get("doc_id", "") or "")
         title = doc.get("title", "")
         url = doc.get("url", "")
         content = doc.get("content", "")
+        content_zh_hant = doc.get("content_zh_hant", content)
+        content_hash = str(doc.get("content_hash", ""))
+        
+        last_offset = 0
         for block in split_by_heading(content):
             for piece in smart_chunk(block, max_len=max_len, overlap=overlap, min_len=min_len):
+                offset = content.find(piece, last_offset)
+                if offset != -1:
+                    piece_zh_hant = content_zh_hant[offset:offset+len(piece)]
+                    last_offset = offset + max(1, len(piece) - overlap)
+                else:
+                    piece_zh_hant = piece
+                
                 chunk = Chunk(
                     chunk_id=f"c_{idx}",
                     doc_id=doc_id,
                     title=title,
                     url=url,
                     text=piece,
+                    text_zh_hant=piece_zh_hant,
+                    content_hash=content_hash,
                 )
                 chunks.append(chunk)
                 idx += 1
@@ -185,6 +201,8 @@ def write_chunks(path: Path, chunks: list[Chunk]) -> None:
                         "title": c.title,
                         "url": c.url,
                         "text": c.text,
+                        "text_zh_hant": c.text_zh_hant,
+                        "content_hash": c.content_hash,
                     },
                     ensure_ascii=False,
                 )
@@ -206,13 +224,38 @@ def load_chunks_jsonl(path: Path) -> list[Chunk]:
                     title=str(obj.get("title", "")),
                     url=str(obj.get("url", "")),
                     text=str(obj.get("text", "")),
+                    text_zh_hant=str(obj.get("text_zh_hant", "")),
+                    content_hash=str(obj.get("content_hash", "")),
                 )
             )
     return chunks
 
 
 def tokenize_zh(text: str) -> list[str]:
-    return [w for w in jieba.lcut(text) if w.strip()]
+    # 使用 SentencePiece 子词分词（需在命令行通过 --sp-model 指定或放在默认位置）
+    global SP
+    try:
+        SP
+    except NameError:
+        SP = None
+    if SP is None:
+        # 尝试在常见位置加载模型
+        default_sp_path = Path(__file__).resolve().parents[2] / "models" / "bge-m3" / "sentencepiece.bpe.model"
+        try:
+            SP = spm.SentencePieceProcessor()
+            SP.Load(str(default_sp_path))
+        except Exception:
+            SP = None
+
+    if SP is not None:
+        try:
+            toks = SP.encode_as_pieces(text)
+            return [t for t in toks if t.strip()]
+        except Exception:
+            pass
+
+    # 回退：按空白分词
+    return [w for w in text.split() if w.strip()]
 
 
 def normalize_rows(mat: np.ndarray) -> np.ndarray:
@@ -451,24 +494,57 @@ def embed_to_memmap(
     return emb_cache_path, dim
 
 
-def build_faiss_from_memmap(emb_cache_path: Path, total: int, dim: int, add_batch_size: int) -> faiss.Index:
+def build_chroma_collection(
+    emb_cache_path: Path,
+    chunks: list[Chunk],
+    total: int,
+    dim: int,
+    add_batch_size: int,
+    persist_dir: Path,
+    collection_name: str,
+) -> chromadb.api.models.Collection.Collection:
     mm = np.memmap(emb_cache_path, dtype=np.float32, mode="r", shape=(total, dim))
-    index = faiss.IndexFlatIP(dim)
+    client = chromadb.PersistentClient(path=str(persist_dir))
+    collection = client.get_or_create_collection(
+        name=collection_name,
+        metadata={"hnsw:space": "cosine"},
+    )
+
     for i in range(0, total, add_batch_size):
         end = min(i + add_batch_size, total)
-        index.add(np.asarray(mm[i:end], dtype=np.float32))
-        print(f"index.add: {end}/{total}", flush=True)
+        batch_embeddings = np.asarray(mm[i:end], dtype=np.float32).tolist()
+        # 与 chunks.jsonl 中 chunk_id、增量脚本 upsert 的 ids 保持一致，便于检索映射与 delete/upsert
+        batch_ids = [chunks[j].chunk_id for j in range(i, end)]
+        batch_docs = [chunks[j].text for j in range(i, end)]
+        batch_metas = [
+            {
+                "chunk_id": chunks[j].chunk_id,
+                "doc_id": str(chunks[j].doc_id),
+                "title": chunks[j].title,
+                "url": chunks[j].url,
+                "content_hash": str(chunks[j].content_hash or ""),
+            }
+            for j in range(i, end)
+        ]
+        collection.upsert(
+            ids=batch_ids,
+            embeddings=batch_embeddings,
+            documents=batch_docs,
+            metadatas=batch_metas,
+        )
+        print(f"collection.upsert: {end}/{total}", flush=True)
+
     # Windows 上 memmap 句柄释放可能延迟，主动释放避免后续 unlink 失败。
     del mm
     gc.collect()
-    return index
+    return collection
 
 
-def validate_outputs(index: faiss.Index, chunks: list[Chunk], dim: int) -> None:
-    if index.d != dim:
-        raise RuntimeError(f"索引维度不一致: index.d={index.d}, dim={dim}")
-    if index.ntotal != len(chunks):
-        raise RuntimeError(f"索引数量不一致: ntotal={index.ntotal}, chunks={len(chunks)}")
+def validate_outputs(collection: chromadb.api.models.Collection.Collection, chunks: list[Chunk], dim: int) -> None:
+    if dim <= 0:
+        raise RuntimeError(f"embedding 维度不合法: dim={dim}")
+    if collection.count() != len(chunks):
+        raise RuntimeError(f"索引数量不一致: count={collection.count()}, chunks={len(chunks)}")
 
 
 def main() -> None:
@@ -490,6 +566,8 @@ def main() -> None:
     parser.add_argument("--resume", action="store_true", help="从上次 embedding 进度续跑")
     parser.add_argument("--state-path", default="", help="embedding 状态文件，默认 build/index_embed.state.json")
     parser.add_argument("--emb-cache", default="", help="embedding 缓存文件，默认 build/embeddings.f32")
+    parser.add_argument("--chroma-dir", default="", help="Chroma 持久化目录，默认 build/chroma_db")
+    parser.add_argument("--collection-name", default="wiki_cn_dense", help="Chroma collection 名称")
     parser.add_argument("--keep-bm25-token-cache", action="store_true", help="完成后保留 BM25 分词缓存文件")
     parser.add_argument("--force-rebuild", action="store_true", help="忽略已有中间文件并从头构建")
     parser.add_argument("--keep-emb-cache", action="store_true", help="完成后保留 embedding 缓存文件")
@@ -520,13 +598,13 @@ def main() -> None:
 
     chunks_path = build_dir / "chunks.jsonl"
     bm25_path = build_dir / "bm25.pkl"
-    faiss_path = build_dir / "faiss.index"
     meta_path = build_dir / "meta.pkl"
     chunk_sig_path = build_dir / "chunks.signature.json"
     bm25_token_cache_path = build_dir / "bm25_tokens.jsonl"
     bm25_token_state_path = build_dir / "bm25_tokens.state.json"
     state_path = Path(args.state_path).resolve() if args.state_path else (build_dir / "index_embed.state.json")
     emb_cache_path = Path(args.emb_cache).resolve() if args.emb_cache else (build_dir / "embeddings.f32")
+    chroma_dir = Path(args.chroma_dir).resolve() if args.chroma_dir else (build_dir / "chroma_db")
     current_chunk_sig = get_chunk_build_signature(
         corpus_path=corpus_path,
         max_len=args.chunk_size,
@@ -538,7 +616,6 @@ def main() -> None:
         for p in [
             chunks_path,
             bm25_path,
-            faiss_path,
             meta_path,
             state_path,
             emb_cache_path,
@@ -548,6 +625,8 @@ def main() -> None:
         ]:
             if p.exists():
                 p.unlink()
+        if chroma_dir.exists():
+            shutil.rmtree(chroma_dir, ignore_errors=True)
 
     if args.resume and chunks_path.exists():
         if not chunk_sig_path.exists():
@@ -668,20 +747,24 @@ def main() -> None:
         emb_cache_path=emb_cache_path,
     )
 
-    index = build_faiss_from_memmap(
+    collection = build_chroma_collection(
         emb_cache_path=emb_file,
+        chunks=chunks,
         total=len(chunks),
         dim=dim,
         add_batch_size=args.index_batch_size,
+        persist_dir=chroma_dir,
+        collection_name=args.collection_name,
     )
-    validate_outputs(index=index, chunks=chunks, dim=dim)
-    raw_index = faiss.serialize_index(index)
-    faiss_path.write_bytes(raw_index.tobytes())
+    validate_outputs(collection=collection, chunks=chunks, dim=dim)
 
     meta = {
         "embed_model": args.embed_model,
         "dim": int(dim),
         "total_chunks": len(chunks),
+        "dense_backend": "chroma",
+        "chroma_dir": str(chroma_dir),
+        "collection_name": args.collection_name,
     }
     with meta_path.open("wb") as f:
         pickle.dump(meta, f)

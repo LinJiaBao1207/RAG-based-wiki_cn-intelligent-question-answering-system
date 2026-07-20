@@ -1,0 +1,48 @@
+# Local environment and secrets
+.env
+.env.*
+*.env
+*.local
+
+# Python cache and virtualenvs
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+.conda/
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs and runtime files
+*.log
+*.sqlite3
+*.db
+*.pid
+
+# Large or generated artifacts
+build/
+old_index/
+*.pkl
+*.f32
+*.pt
+*.safetensors
+*.onnx
+*.bin
+*.npy
+*.npz
+*.parquet
+
+# Notebook artifacts
+.ipynb_checkpoints/
